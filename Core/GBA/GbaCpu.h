@@ -22,6 +22,7 @@ private:
 	uint32_t _opCode = 0;
 	GbaCpuState _state = {};
 	uint8_t _ldmGlitch = 0;
+	bool _hasPendingIrq = false;
 
 	GbaMemoryManager* _memoryManager = nullptr;
 	GbaRomPrefetch* _prefetch = nullptr;
@@ -71,6 +72,7 @@ private:
 	}
 
 	GbaCpuFlags& GetSpsr();
+	void SetStatusFlags(bool writeToSpsr, uint8_t mask, uint32_t value);
 
 	static void InitArmOpTable();
 	void ArmBranchExchangeRegister();
@@ -205,12 +207,12 @@ public:
 		if(_memoryManager->IsSystemStopped()) {
 			_memoryManager->ProcessStoppedCycle();
 		} else {
-			_memoryManager->ProcessInternalCycle<true>();
+			_memoryManager->ProcessIdleCycle();
 		}
 
 		if(isHaltOver) {
-			_memoryManager->ProcessInternalCycle<true>();
-			_state.Stopped = false;
+			_memoryManager->ProcessIdleCycle();
+			_state.Stopped = _state.Frozen;
 			return false;
 		} else {
 			return true;
@@ -268,8 +270,8 @@ public:
 			ReloadPipeline();
 		}
 
-		bool checkIrq = _memoryManager->ProcessIrq();
-		if(checkIrq && startClock != _memoryManager->GetMasterClock()) {
+		bool hasPendingIrq = _hasPendingIrq;
+		if(hasPendingIrq && startClock != _memoryManager->GetMasterClock()) {
 			//TST, TEQ, CMP, CMN can modify the I flag without any fetch/idle cycles.
 			//In that case, the IRQ handling is done using the original I flag before the instruction was executed. (Passes "psr" test)
 			//Otherwise, use the current I flag.
@@ -277,16 +279,21 @@ public:
 		}
 
 		ProcessPipeline();
-		if(!irqDisable && checkIrq) {
+		if(!irqDisable && hasPendingIrq) {
 			CheckForIrqs();
 		}
 #endif
 	}
 
-	void SetStopFlag() { _state.Stopped = true; }
+	bool IsHalted() { return _state.Stopped; }
+	void SetStopFlag(bool freeze = false) {
+		_state.Stopped = true;
+		_state.Frozen = freeze;
+	}
+
 	void ClearSequentialFlag() { _state.Pipeline.Mode &= ~GbaAccessMode::Sequential; }
 	void SetSequentialFlag() { _state.Pipeline.Mode |= GbaAccessMode::Sequential; }
-
+	
 	void PowerOn();
 
 	void Serialize(Serializer& s) override;

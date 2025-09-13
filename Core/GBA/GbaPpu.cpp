@@ -74,7 +74,6 @@ GbaPpu::~GbaPpu()
 void GbaPpu::ProcessHBlank()
 {
 	if(_state.Scanline < 160) {
-		RenderScanline();
 		_console->GetDmaController()->TriggerDma(GbaDmaTrigger::HBlank);
 	} else {
 		ProcessLayerToggleDelay();
@@ -224,7 +223,7 @@ void GbaPpu::RenderScanline(bool forceRender)
 	ProcessSprites();
 	ProcessWindow();
 
-	if(_state.Scanline >= 160 || _lastRenderCycle >= 1006) {
+	if(_state.Scanline >= 160 || _lastRenderCycle >= 1056) {
 		return;
 	}
 
@@ -544,7 +543,14 @@ void GbaPpu::PushBgPixels(int renderX)
 template<int i>
 void GbaPpu::RenderTilemap()
 {
-	if(!_state.BgLayers[i].Enabled || _emu->GetSettings()->GetGbaConfig().HideBgLayers[i]) {
+	if(_lastRenderCycle == -1) {
+		_layerData[i].NextLoad = -1;
+		_layerData[i].TileFetchCounter = 0;
+		_layerData[i].RenderingDone = false;
+		_layerData[i].LastTile = false;
+	}
+
+	if(_layerData[i].RenderingDone || !_state.BgLayers[i].Enabled || _emu->GetSettings()->GetGbaConfig().HideBgLayers[i]) {
 		return;
 	}
 
@@ -581,13 +587,9 @@ void GbaPpu::RenderTilemap()
 
 	yPos &= 0xFF;
 
-	if(_lastRenderCycle == -1) {
-		_layerData[i].NextLoad = -1;
-	}
-
 	int gap = 4 + i;
-	int cycle = std::max(0, _lastRenderCycle + 1 - gap) & ~0x03;
-	int end = std::min<int>(_state.Cycle, 1006) - gap;
+	int cycle = (std::max(0, _lastRenderCycle + 4 - gap)) & ~0x03;
+	int end = _state.Cycle - gap;
 	for(; cycle <= end; cycle += 4) {
 		int pixelOffset = (cycle >> 2) - 7;
 		if(((pixelOffset + layer.ScrollX) & 0x07) == 0) {
@@ -613,6 +615,20 @@ void GbaPpu::RenderTilemap()
 			_layerData[i].FetchAddr = layer.TilesetAddr + _layerData[i].TileIndex * (bpp8 ? 64 : 32) + _layerData[i].TileRow * (bpp8 ? 8 : 4) + _layerData[i].TileColumn;
 
 			_layerData[i].NextLoad = cycle + 4;
+			_layerData[i].TileFetchCounter = bpp8 ? 4 : 2;
+
+			if((cycle / 32) >= (((layer.ScrollX & 0x07) < 5) ? 30 : 31)) {
+				//Stop rendering for this tile after the tile data is fetched
+				_layerData[i].LastTile = true;
+			}
+
+			if constexpr(i < 3) {
+				if((cycle / 32) >= 31 && (layer.ScrollX & 0x07) == 5) {
+					//Fetches stop earlier in this scenario (tilemap is fetched, but not tile data)
+					_layerData[i].RenderingDone = true;
+					break;
+				}
+			}
 		} else if(_layerData[i].NextLoad == cycle) {
 			//Fetch tile data (4bpp & 8bpp)
 			_layerData[i].TileData = _vram16[_layerData[i].FetchAddr >> 1];
@@ -620,6 +636,12 @@ void GbaPpu::RenderTilemap()
 			_memoryAccess[cycle + gap] |= GbaPpuMemAccess::Vram;
 
 			_layerData[i].NextLoad = cycle + (bpp8 ? 8 : 16);
+			_layerData[i].TileFetchCounter--;
+			if(_layerData[i].TileFetchCounter == 0 && _layerData[i].LastTile) {
+				//Stop fetching, rendering is done for this layer
+				_layerData[i].RenderingDone = true;
+				break;
+			}
 		}
 	}
 }
@@ -753,7 +775,7 @@ static constexpr uint8_t _sprSize[4][4][2] = {
 
 void GbaPpu::ProcessSprites()
 {
-	if(!_emu->GetSettings()->GetGbaConfig().DisableSprites && _state.ObjLayerEnabled && (_state.Scanline <= 159 || _state.Scanline == _lastScanline)) {
+	if(!_emu->GetSettings()->GetGbaConfig().DisableSprites && (_state.Scanline <= 159 || _state.Scanline == _lastScanline)) {
 		if(_state.BgMode >= 3) {
 			RenderSprites<true>();
 		} else {
@@ -895,17 +917,11 @@ void GbaPpu::RenderSprites()
 	}
 
 	uint16_t ppuCycle = _state.Cycle >= 308 * 4 ? (308 * 4) - 1 : _state.Cycle;
-	if(_state.AllowHblankOamAccess && ppuCycle > 999) {
-		//Evaluation stops just before hblank when this is enabled
-		ppuCycle = 999;
-	}
 	int cycle = _oamLastCycle + 1;
 
-	if(cycle < 41 && (_state.AllowHblankOamAccess || _evalOamIndex >= 128 || _state.ObjEnableTimer > 0)) {
+	if(cycle < 41 && (_state.AllowHblankOamAccess || _evalOamIndex >= 128)) {
 		//Evaluation in hblank is disabled, jump to cycle 40 (eval start)
 		cycle = 41;
-	} else if(cycle >= 41 && _state.ObjEnableTimer > 0) {
-		return;
 	}
 
 	if(!(cycle & 0x01)) {
@@ -916,13 +932,17 @@ void GbaPpu::RenderSprites()
 		if(cycle == 41) {
 			//start oam evaluation/fetching
 			InitSpriteEvaluation();
-			if(_oamScanline == 160 || _state.ObjEnableTimer > 0) {
+			if(_oamScanline == 160) {
 				//Scanline 159 stops processing sprites after cycle 39
 				break;
 			}
 		}
 
 		bool allowLoadAttr01 = _loadOamTileCounter <= 1 || _isFirstOamTileLoad;
+		if(_state.AllowHblankOamAccess && cycle > 999 && _loadOamAttr01) {
+			//Evaluation stops just before hblank when this is enabled
+			break;
+		}
 
 		if(_loadOamTileCounter) {
 			if(_isFirstOamTileLoad && _objData[1].TransformEnabled) {
@@ -931,10 +951,13 @@ void GbaPpu::RenderSprites()
 				//load+draw pixels
 				_isFirstOamTileLoad = false;
 				_loadOamTileCounter--;
-				_memoryAccess[cycle] |= GbaPpuMemAccess::VramObj;
 
 				//Last cycle (40) doesn't actually draw, but cycle 39 does read from VRAM anyway (Sprite_Last_VRAM_Access test)
 				//When hblank access flag is set, pixel output stops on cycle 998 (and last read is on cycle 999)  (Sprite_Last_VRAM_Access_Free test)
+				if(!_state.AllowHblankOamAccess || cycle <= 999) {
+					_memoryAccess[cycle] |= GbaPpuMemAccess::VramObj;
+				}
+
 				if((!_state.AllowHblankOamAccess && cycle != 39) || (_state.AllowHblankOamAccess && cycle < 999)) {
 					if(_objData[1].TransformEnabled) {
 						RenderSprite<true, blockFirst16k>(_objData[1]);
@@ -974,6 +997,10 @@ void GbaPpu::RenderSprites()
 				continue;
 			}
 			
+			if(!_state.ObjLayerEnabled) {
+				continue;
+			}
+
 			_memoryAccess[cycle] |= GbaPpuMemAccess::Oam;
 
 			uint16_t addr = _evalOamIndex << 1;
@@ -1076,7 +1103,9 @@ void GbaPpu::RenderSprite(GbaSpriteRendererData& spr)
 					if(spr.Mode == GbaPpuObjMode::Blending) {
 						colorIndex |= GbaPpu::SpriteBlendFlag;
 					}
-					SetPixelData(_oamWriteOutput[drawPos], colorIndex, spr.Priority, GbaPpu::SpriteLayerIndex);
+					if(_state.ObjEnableTimer == 0 && _state.ObjLayerEnabled) {
+						SetPixelData(_oamWriteOutput[drawPos], colorIndex, spr.Priority, GbaPpu::SpriteLayerIndex);
+					}
 				}
 			} else if(isHigherPriority && _oamWriteOutput[drawPos].Priority != 0xFF) {
 				//If a sprite pixel already exists and another sprite with higher priority with a
@@ -1173,6 +1202,22 @@ void GbaPpu::ProcessLayerToggleDelay()
 	}
 }
 
+void GbaPpu::ProcessObjEnableChange()
+{
+	RenderScanline();
+
+	if(_state.ObjLayerEnabled && !_newObjLayerEnabled) {
+		//Clear sprite row buffers when OBJ layer is disabled
+		//TODOGBA what does hardware do if sprites are re-enabled on the same or next scanline?
+		std::fill(_oamOutputBuffers[0], _oamOutputBuffers[0] + 240, GbaPixelData {});
+		std::fill(_oamOutputBuffers[1], _oamOutputBuffers[1] + 240, GbaPixelData {});
+	} else if(!_state.ObjLayerEnabled && _newObjLayerEnabled) {
+		_state.ObjEnableTimer = _state.Scanline >= 160 ? 0 : 3;
+	}
+
+	_state.ObjLayerEnabled = _newObjLayerEnabled;
+}
+
 void GbaPpu::SetLayerEnabled(int layer, bool enabled)
 {
 	//"Layer toggle 2" test seems to imply that fully disabling a layer has a delay and that
@@ -1195,7 +1240,7 @@ void GbaPpu::SetLayerEnabled(int layer, bool enabled)
 void GbaPpu::WriteRegister(uint32_t addr, uint8_t value)
 {
 	if(_lastRenderCycle != _state.Cycle && (_state.Scanline < 160 || _state.Scanline == _lastScanline)) {
-		if(_state.Cycle < 1006 || addr <= 0x01 || addr == 0x4D || addr >= 0x40 && addr <= 0x43) {
+		if(_state.Cycle < 1056 || addr <= 0x01 || addr == 0x4D || (addr >= 0x40 && addr <= 0x43)) {
 			//Only run renderer during active rendering (< 1006), or if the write could affect sprites/window processing
 			RenderScanline(true);
 		}
@@ -1227,15 +1272,10 @@ void GbaPpu::WriteRegister(uint32_t addr, uint8_t value)
 			SetLayerEnabled(2, value & 0x04);
 			SetLayerEnabled(3, value & 0x08);
 			bool objEnabled = value & 0x10;
-			if(_state.ObjLayerEnabled && !objEnabled) {
-				//Clear sprite row buffers when OBJ layer is disabled
-				//TODOGBA what does hardware do if sprites are re-enabled on the same or next scanline?
-				std::fill(_oamOutputBuffers[0], _oamOutputBuffers[0] + 240, GbaPixelData {});
-				std::fill(_oamOutputBuffers[1], _oamOutputBuffers[1] + 240, GbaPixelData {});
-			} else if(!_state.ObjLayerEnabled && objEnabled) {
-				_state.ObjEnableTimer = _state.Scanline >= 160 ? 0 : 3;
+			if(objEnabled != _state.ObjLayerEnabled) {
+				_newObjLayerEnabled = objEnabled;
+				_memoryManager->TriggerObjEnableUpdate();
 			}
-			_state.ObjLayerEnabled = objEnabled;
 			_state.Window0Enabled = value & 0x20;
 			_state.Window1Enabled = value & 0x40;
 			_state.ObjWindowEnabled = value & 0x80;
@@ -1614,6 +1654,8 @@ void GbaPpu::Serialize(Serializer& s)
 		SV(_oamMosaicY);
 		SV(_oamMosaicScanline);
 
+		SV(_newObjLayerEnabled);
+
 		for(int i = 0; i < 4; i++) {
 			SVI(_layerData[i].TilemapData);
 			SVI(_layerData[i].TileData);
@@ -1631,6 +1673,9 @@ void GbaPpu::Serialize(Serializer& s)
 			SVI(_layerData[i].TileRow);
 			SVI(_layerData[i].TileColumn);
 			SVI(_layerData[i].MosaicColor);
+			SVI(_layerData[i].TileFetchCounter);
+			SVI(_layerData[i].RenderingDone);
+			SVI(_layerData[i].LastTile);
 		}
 
 		for(int i = 0; i < 2; i++) {

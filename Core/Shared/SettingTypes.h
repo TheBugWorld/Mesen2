@@ -11,6 +11,7 @@ enum class EmulationFlags
 	InBackground = 0x08,
 	ConsoleMode = 0x10,
 	TestMode = 0x20,
+	OutputToStdout = 0x40,
 };
 
 enum class ScaleFilterType
@@ -180,6 +181,7 @@ enum class ControllerType
 	SnesMouse,
 	SuperScope,
 	Multitap,
+	SnesRumbleController,
 
 	//NES controllers
 	NesController,

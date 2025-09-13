@@ -32,6 +32,10 @@ struct GbaLayerRendererData
 	uint8_t TileRow;
 	uint8_t TileColumn;
 	uint8_t MosaicColor;
+
+	uint8_t TileFetchCounter;
+	bool RenderingDone;
+	bool LastTile;
 };
 
 struct GbaSpriteRendererData
@@ -127,7 +131,7 @@ private:
 
 	Timer _frameSkipTimer;
 	bool _skipRender = false;
-	
+
 	bool _triggerSpecialDma = false;
 
 	int16_t _lastWindowCycle = -1;
@@ -152,6 +156,8 @@ private:
 	uint8_t _oamScanline = 0;
 	uint8_t _oamMosaicScanline = 0;
 	uint8_t _oamMosaicY = 0;
+
+	bool _newObjLayerEnabled = false;
 
 	uint8_t _memoryAccess[308 * 4] = {};
 	
@@ -234,8 +240,12 @@ public:
 
 		if(_state.Cycle == 308*4) {
 			ProcessEndOfScanline();
-		} else if(_state.Cycle == 1006) {
-			ProcessHBlank();
+		} else if(_state.Cycle >= 1006) {
+			if(_state.Cycle == 1006) {
+				ProcessHBlank();
+			} else if(_state.Cycle == 1056) {
+				RenderScanline();
+			}
 		}
 
 		_emu->ProcessPpuCycle<CpuType::Gba>();
@@ -245,6 +255,8 @@ public:
 	{
 		return _memoryAccess[_state.Cycle] & memType;
 	}
+
+	void ProcessObjEnableChange();
 
 	void RenderScanline(bool forceRender = false);
 	

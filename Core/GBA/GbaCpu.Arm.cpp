@@ -15,10 +15,19 @@ ArmOpCategory GbaCpu::GetArmOpCategory(uint32_t opCode)
 
 void GbaCpu::ArmBranchExchangeRegister()
 {
+	//A lot of this behavior is not officially documented in the data sheet (and is similar to the behavior of MSR)
+	//Passes png183's "branches" test: https://github.com/png183/gba-tests/blob/master/arm/
+	uint8_t mask = (_opCode >> 16) & 0x0F;
 	uint32_t value = R(_opCode & 0x0F);
-	_state.CPSR.Thumb = (value & 0x01) != 0;
-	_state.R[15] = value;
-	_state.Pipeline.ReloadRequested = true;
+	bool writeToSpsr = _opCode & (1 << 22);
+	if((mask & 0x09) == 0x09) {
+		GbaCpuFlags& flags = writeToSpsr ? GetSpsr() : _state.CPSR;
+		flags.Thumb = (value & 0x01) != 0;
+	} else {
+		SetStatusFlags(writeToSpsr, mask, value);
+	}
+	uint8_t rd = (_opCode >> 12) & 0x0F;
+	SetR(rd, value);
 }
 
 void GbaCpu::ArmBranch()
@@ -59,6 +68,15 @@ void GbaCpu::ArmMsr()
 		value = R(_opCode & 0x0F);
 	}
 
+	SetStatusFlags(writeToSpsr, mask, value);
+}
+
+void GbaCpu::SetStatusFlags(bool writeToSpsr, uint8_t mask, uint32_t value)
+{
+	if(writeToSpsr && (_state.CPSR.Mode == GbaCpuMode::User || _state.CPSR.Mode == GbaCpuMode::System)) {
+		return;
+	}
+
 	GbaCpuFlags& flags = writeToSpsr ? GetSpsr() : _state.CPSR;
 	if(mask & 0x08) {
 		flags.Negative = value & (1 << 31);
@@ -66,7 +84,7 @@ void GbaCpu::ArmMsr()
 		flags.Carry = value & (1 << 29);
 		flags.Overflow = value & (1 << 28);
 	}
-	
+
 	if(mask & 0x01) {
 		if(writeToSpsr || _state.CPSR.Mode != GbaCpuMode::User) {
 			if(!writeToSpsr) {
@@ -195,7 +213,9 @@ void GbaCpu::ArmMultiply()
 	Idle(output.CycleCount);
 
 	uint32_t result = output.Output;
-	SetR(rd, result);
+	if(rd != 15) {
+		SetR(rd, result);
+	}
 	
 	if(updateFlags) {
 		_state.CPSR.Carry = output.Carry;
@@ -246,8 +266,12 @@ void GbaCpu::ArmMultiplyLong()
 
 	uint64_t result = output.Output;
 
-	SetR(rl, (uint32_t)result);
-	SetR(rh, (uint32_t)(result >> 32));
+	if(rl != 15) {
+		SetR(rl, (uint32_t)result);
+	}
+	if(rh != 15) {
+		SetR(rh, (uint32_t)(result >> 32));
+	}
 
 	if(updateFlags) {
 		_state.CPSR.Carry = output.Carry;
@@ -357,10 +381,11 @@ void GbaCpu::ArmSignedHalfDataTransfer()
 		}
 		Idle();
 	} else {
+		uint32_t value = R(rd) + (rd == 15 ? 4 : 0);
 		if(half) {
-			Write(GbaAccessMode::HalfWord | (sign ? GbaAccessMode::Signed : 0), addr, R(rd));
+			Write(GbaAccessMode::HalfWord | (sign ? GbaAccessMode::Signed : 0), addr, value);
 		} else {
-			Write(GbaAccessMode::Byte | (sign ? GbaAccessMode::Signed : 0), addr, R(rd));
+			Write(GbaAccessMode::Byte | (sign ? GbaAccessMode::Signed : 0), addr, value);
 		}
 	}
 
@@ -369,7 +394,7 @@ void GbaCpu::ArmSignedHalfDataTransfer()
 	}
 
 	if((rd != rn || !load) && (writeBack || !pre)) {
-		SetR(rn, addr);
+		SetR(rn, addr + (rn == 15 ? 4 : 0));
 	}
 }
 
@@ -392,7 +417,7 @@ void GbaCpu::ArmBlockDataTransfer()
 	uint8_t rn = (_opCode >> 16) & 0x0F;
 	uint16_t regMask = (uint16_t)_opCode;
 
-	uint32_t base = R(rn) + (rn == 15 ? 4 : 0);
+	uint32_t base = R(rn);
 	uint32_t addr = base;
 
 	uint8_t regCount = 0;
@@ -481,7 +506,7 @@ void GbaCpu::ArmSingleDataSwap()
 	uint32_t src = R(rn);
 	uint32_t val = Read(mode, src);
 	Idle();
-	Write(mode, src, R(rm));
+	Write(mode, src, rm == 15 ? (R(rm) + 4) : R(rm));
 #ifndef DUMMYCPU
 	_memoryManager->UnlockBus();
 #endif
@@ -529,8 +554,10 @@ void GbaCpu::InitArmOpTable()
 	}
 
 	//Branch and Exchange (BX)
-	//----_0001_0010_----_----_----_0001_----
-	addEntry(0x121, &GbaCpu::ArmBranchExchangeRegister, ArmOpCategory::BranchExchangeRegister);
+	//----_0001_0?10_----_----_----_0??1_----
+	for(int i = 0; i <= 0x0F; i++) {
+		addEntry(0x101 | ((i & 0x03) << 1) | ((i & 0x0C) << 3), &GbaCpu::ArmBranchExchangeRegister, ArmOpCategory::BranchExchangeRegister);
+	}
 
 	//Branch and Branch with Link (B, BL)
 	//----_101?_????_----_----_----_????_----
@@ -557,8 +584,8 @@ void GbaCpu::InitArmOpTable()
 	}
 
 	//Multiply and Multiply-Accumulate (MUL, MLA)
-	//----_0000_00??_----_----_----_1001_----
-	for(int i = 0; i <= 0x03; i++) {
+	//----_0000_0???_----_----_----_1001_----
+	for(int i = 0; i <= 0x07; i++) {
 		addEntry(0x009 | (i << 4), &GbaCpu::ArmMultiply, ArmOpCategory::Multiply);
 	}
 
@@ -569,9 +596,11 @@ void GbaCpu::InitArmOpTable()
 	}
 
 	//Single Data Swap (SWP)
-	//----_0001_0000_----_----_----_1001_----
-	addEntry(0x109, &GbaCpu::ArmSingleDataSwap, ArmOpCategory::SingleDataSwap); //word
-	addEntry(0x149, &GbaCpu::ArmSingleDataSwap, ArmOpCategory::SingleDataSwap); //byte
+	//----_0001_?0??_----_----_----_1001_----
+	for(int i = 0; i <= 0x07; i++) {
+		addEntry(0x109 | (i & 0x04) << 5 | (i & 0x03) << 4, &GbaCpu::ArmSingleDataSwap, ArmOpCategory::SingleDataSwap); //word
+		addEntry(0x149 | (i & 0x04) << 5 | (i & 0x03) << 4, &GbaCpu::ArmSingleDataSwap, ArmOpCategory::SingleDataSwap); //byte
+	}
 
 	for(int i = 0; i <= 0xFF; i++) {
 		addEntry(0xF00 + i, &GbaCpu::ArmSoftwareInterrupt, ArmOpCategory::SoftwareInterrupt);

@@ -283,6 +283,7 @@ public struct GbaCpuState : BaseState
 	public UInt32[] R;
 	public GbaCpuFlags CPSR;
 	[MarshalAs(UnmanagedType.I1)] public bool Stopped;
+	[MarshalAs(UnmanagedType.I1)] public bool Frozen;
 
 	[MarshalAs(UnmanagedType.ByValArray, SizeConst = 7)]
 	public UInt32[] UserRegs;
@@ -465,8 +466,8 @@ public struct GbaRomPrefetchState
 	public UInt32 ReadAddr;
 	public UInt32 PrefetchAddr;
 	public byte ClockCounter;
-	public byte BoundaryCyclePenalty;
 	[MarshalAs(UnmanagedType.I1)] public bool WasFilled;
 	[MarshalAs(UnmanagedType.I1)] public bool Started;
 	[MarshalAs(UnmanagedType.I1)] public bool Sequential;
+	[MarshalAs(UnmanagedType.I1)] public bool HitBoundary;
 }

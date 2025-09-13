@@ -71,6 +71,17 @@ void GbaDmaController::TriggerDma(GbaDmaTrigger trigger)
 	}
 }
 
+int GbaDmaController::GetPendingDmaIndex()
+{
+	uint64_t start = _memoryManager->GetMasterClock();
+	for(int i = 0; i < 4; i++) {
+		if(_state.Ch[i].Pending && start >= _state.Ch[i].StartClock) {
+			return i;
+		}
+	}
+	return -1;
+}
+
 void GbaDmaController::RunPendingDma(bool allowStartDma)
 {
 	if(_dmaRunning) {
@@ -87,35 +98,37 @@ void GbaDmaController::RunPendingDma(bool allowStartDma)
 		return;
 	}
 
-	uint64_t start = _memoryManager->GetMasterClock();
-	
-	bool canStart = false;
-	for(int i = 0; i < 4; i++) {
-		if(_state.Ch[i].Pending && start >= _state.Ch[i].StartClock) {
-			canStart = true;
-			break;
-		}
-	}
+	int chIndex = GetPendingDmaIndex();
 
-	if(!canStart) {
+	if(chIndex < 0) {
 		//Too early to start DMA
 		return;
 	}
 
 	_dmaRunning = true;
 	_needStart = false;
+	_memoryManager->ProcessDmaStart();
 
-	//Before starting DMA, an additional idle cycle executes (CPU is blocked during this)
-	_memoryManager->ProcessIdleCycle();
+	uint64_t start = _memoryManager->GetMasterClock();
+	chIndex = GetPendingDmaIndex();
+	do {
+		//Before starting DMA, an additional idle cycle executes (CPU is blocked during this)
+		_memoryManager->ProcessIdleCycle();
 
-	for(int i = 0; i < 4; i++) {
-		if(_state.Ch[i].Pending && start >= _state.Ch[i].StartClock) {
-			RunDma(_state.Ch[i], i);
-		}
-	}
+		do {
+			RunDma(_state.Ch[chIndex], chIndex);
+			
+			//Keep going so long as at least one DMA channel is ready to run
+			chIndex = GetPendingDmaIndex();
+		} while(chIndex >= 0);
 
-	//After stopping DMA, an additional idle cycle executes (CPU is blocked during this)
-	_memoryManager->ProcessIdleCycle();
+		//After stopping DMA, an additional idle cycle executes (CPU is blocked during this)
+		_memoryManager->ProcessIdleCycle();
+
+		//Check if the last idle cycle enabled another DMA channel, if so, restart immediately (the idle cycles are repeated)
+		chIndex = GetPendingDmaIndex();
+	} while(chIndex >= 0);
+
 	_dmaRunning = false;
 	_needStart = _dmaPending;
 
@@ -275,7 +288,8 @@ void GbaDmaController::RunDma(GbaDmaChannel& ch, uint8_t chIndex)
 	_cpu->ClearSequentialFlag();
 
 	if(ch.IrqEnabled) {
-		_memoryManager->SetIrqSource((GbaIrqSource)((int)GbaIrqSource::DmaChannel0 << chIndex));
+		//IRQ flag is delayed by 1 cycle according to the fifo_6 test
+		_memoryManager->SetDelayedIrqSource((GbaIrqSource)((int)GbaIrqSource::DmaChannel0 << chIndex), 1);
 	}
 }
 

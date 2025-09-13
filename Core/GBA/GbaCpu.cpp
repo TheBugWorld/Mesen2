@@ -102,10 +102,10 @@ void GbaCpu::SwitchMode(GbaCpuMode mode)
 void GbaCpu::ReloadPipeline()
 {
 	GbaCpuPipeline& pipe = _state.Pipeline;
-	pipe.Mode = GbaAccessMode::Prefetch | (_state.CPSR.Thumb ? GbaAccessMode::HalfWord : GbaAccessMode::Word);
+	pipe.Mode = GbaAccessMode::Prefetch | GbaAccessMode::NoRotate | (_state.CPSR.Thumb ? GbaAccessMode::HalfWord : GbaAccessMode::Word);
 
 	pipe.ReloadRequested = false;
-	pipe.Fetch.Address = _state.R[15] = _state.R[15] & (_state.CPSR.Thumb ? ~0x01 : ~0x03);
+	pipe.Fetch.Address = _state.R[15] = _state.R[15] & ~0x01;
 	_prefetch->ForceNonSequential(_state.R[15]);
 
 	pipe.Fetch.OpCode = ReadCode(pipe.Mode, pipe.Fetch.Address);
@@ -146,14 +146,17 @@ void GbaCpu::ProcessException(GbaCpuMode mode, GbaCpuVector vector)
 uint32_t GbaCpu::ReadCode(GbaAccessModeVal mode, uint32_t addr)
 {
 #ifndef DUMMYCPU
-	//Next access should be sequential
-	//This is done before the call to Read() because e.g if DMA pauses the CPU and 
-	//runs, the next access will not be sequential (force-nseq-access test)
-	_state.Pipeline.Mode |= GbaAccessMode::Sequential;
 	if(_ldmGlitch) {
 		_ldmGlitch--;
 	}
-	return _memoryManager->Read(mode, addr);
+
+	uint32_t value = _memoryManager->Read(mode, addr);
+	_hasPendingIrq = _memoryManager->HasPendingIrq();
+	
+	//Next access should be sequential
+	_state.Pipeline.Mode |= GbaAccessMode::Sequential;
+
+	return value;
 #else
 	uint32_t value = _memoryManager->DebugCpuRead(mode, addr);
 	LogMemoryOperation(addr, value, mode, MemoryOperationType::ExecOpCode);
@@ -168,7 +171,9 @@ uint32_t GbaCpu::Read(GbaAccessModeVal mode, uint32_t addr)
 	if(_ldmGlitch) {
 		_ldmGlitch--;
 	}
-	return _memoryManager->Read(mode, addr);
+	uint32_t value = _memoryManager->Read(mode, addr);
+	_hasPendingIrq = _memoryManager->HasPendingIrq();
+	return value;
 #else
 	uint32_t value = _memoryManager->DebugCpuRead(mode, addr);
 	LogMemoryOperation(addr, value, mode, MemoryOperationType::Read);
@@ -184,6 +189,7 @@ void GbaCpu::Write(GbaAccessModeVal mode, uint32_t addr, uint32_t value)
 		_ldmGlitch--;
 	}
 	_memoryManager->Write(mode, addr, value);
+	_hasPendingIrq = _memoryManager->HasPendingIrq();
 #else
 	LogMemoryOperation(addr, value, mode, MemoryOperationType::Write);
 #endif
@@ -197,6 +203,7 @@ void GbaCpu::Idle()
 		_ldmGlitch--;
 	}
 	_memoryManager->ProcessIdleCycle();
+	_hasPendingIrq = _memoryManager->HasPendingIrq();
 #endif
 }
 
@@ -369,6 +376,7 @@ void GbaCpu::Serialize(Serializer& s)
 	SV(_state.CPSR.Negative);
 
 	SV(_state.Stopped);
+	SV(_state.Frozen);
 	SVArray(_state.R, 16);
 	SVArray(_state.UserRegs, 7);
 	SVArray(_state.FiqRegs, 7);
@@ -425,4 +433,5 @@ void GbaCpu::Serialize(Serializer& s)
 	SV(_state.CycleCount);
 
 	SV(_ldmGlitch);
+	SV(_hasPendingIrq);
 }
